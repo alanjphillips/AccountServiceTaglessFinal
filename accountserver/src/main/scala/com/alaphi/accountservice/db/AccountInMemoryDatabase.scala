@@ -24,14 +24,12 @@ class AccountInMemoryDatabase[F[_]: ConcurrentEffect] private(storage: Ref[F, Ma
   def deposit(accountNumber: String, amount: Int): EitherT[F, AccountError, DepositSuccess] = for {
     accAccess <- getAccountAccess(accountNumber)
     _ <- EitherT.right(accAccess.acquireAccount)
-    accountDeposit = accAccess.account.copy(balance = accAccess.account.balance + amount)
+    accountDeposit = plusBalance(accAccess.account, amount)
     depositResult <-
       EitherT[F, AccountError, DepositSuccess](
-        storage.update(accAccMap =>
-          accAccMap.updated(accAccess.account.accNumber, accAccess.copy(account = accountDeposit))
-        ).map(_ => Right(DepositSuccess(accountDeposit, amount)))
+        F.guarantee(updateStorage(accAccess, accountDeposit))(release(accAccess).void)
+          .map(_ => Right(DepositSuccess(accountDeposit, amount)))
       )
-  //  _ <- EitherT.right(F.guarantee(release(accAccess).void))  // TODO fix this
   } yield depositResult
 
   def transfer(srcAccNum: String, destAccNum: String, amount: Int): EitherT[F, AccountError, TransferSuccess] = for {
@@ -39,19 +37,19 @@ class AccountInMemoryDatabase[F[_]: ConcurrentEffect] private(storage: Ref[F, Ma
     accAccessDest <- getAccountAccess(destAccNum)
     _ <- EitherT.right(accAccessSrc.acquireAccount)
     _ <- EitherT.right(accAccessDest.acquireAccount)
-    transferResult <- EitherT(adjust(accAccessSrc, accAccessDest, amount))
- //   _ <- EitherT.right(F.guarantee(release(accAccessSrc, accAccessDest).void))  // TODO fix this
+    transferResult <- EitherT(
+      F.guarantee(adjust(accAccessSrc, accAccessDest, amount))(release(accAccessSrc, accAccessDest).void)
+    )
   } yield transferResult
 
   private def adjust(accAccessSrc: AccountAccess[F], accAccessDest: AccountAccess[F], amount: Int): F[Either[AccountError, TransferSuccess]] =
     if (accAccessSrc.account.balance >= amount) {
-      val accDebit = accAccessSrc.account.copy(balance = accAccessSrc.account.balance - amount)
-      val accCredit = accAccessDest.account.copy(balance = accAccessDest.account.balance + amount)
-      storage.update(accAccMap =>
-        accAccMap
-          .updated(accAccessSrc.account.accNumber, accAccessSrc.copy(account = accDebit))
-          .updated(accAccessDest.account.accNumber, accAccessDest.copy(account = accCredit))
-      ).map(_ => Right(TransferSuccess(accDebit, accCredit, amount)))
+      val accDebit = minusBalance(accAccessSrc.account, amount)
+      val accCredit = plusBalance(accAccessDest.account, amount)
+      for {
+        _ <- updateStorage(accAccessSrc, accDebit)
+        _ <- updateStorage(accAccessDest, accCredit)
+      } yield Right(TransferSuccess(accDebit, accCredit, amount))
     } else
       F.delay(Left(TransferFailed(accAccessSrc.account, accAccessDest.account, amount, s"Not enough funds available in account number: ${accAccessSrc.account.accNumber}")))
 
@@ -64,9 +62,20 @@ class AccountInMemoryDatabase[F[_]: ConcurrentEffect] private(storage: Ref[F, Ma
         .map(_.get(accountNumber)
           .toRight[AccountError](AccountNotFound(accountNumber, s"Account Number doesn't exist: $accountNumber"))))
 
+  private def updateStorage(accAccess: AccountAccess[F], updatedAccount: Account): F[Unit] =
+    storage.update(accAccMap =>
+      accAccMap.updated(
+        accAccess.account.accNumber,
+        accAccess.copy(account = updatedAccount)
+      )
+    )
+
   private def generateAccountNumber: F[String] =
     storage.get.map(accounts => (accounts.size + 1).toString)
 
+  private def plusBalance(account: Account, plusAmount: Int) = account.copy(balance = account.balance + plusAmount)
+
+  private def minusBalance(account: Account, minusAmount: Int) = account.copy(balance = account.balance - minusAmount)
 }
 
 object AccountInMemoryDatabase {
