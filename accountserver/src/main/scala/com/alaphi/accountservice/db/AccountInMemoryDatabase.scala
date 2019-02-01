@@ -23,20 +23,17 @@ class AccountInMemoryDatabase[F[_]: ConcurrentEffect] private(storage: Ref[F, Ma
 
   def deposit(accountNumber: String, amount: Int): EitherT[F, AccountError, DepositSuccess] = for {
     accAccess <- getAccountAccess(accountNumber)
-    _ <- EitherT.right(accAccess.acquireAccount)
     depositResult <-
       EitherT[F, AccountError, DepositSuccess](
-        F.guarantee(persistDeposit(accAccess, amount))(release(accAccess).void)
+        F.bracket(acquire(accAccess).void)(_ => persistDeposit(accAccess, amount))(_ => release(accAccess).void)
       )
   } yield depositResult
 
   def transfer(srcAccNum: String, destAccNum: String, amount: Int): EitherT[F, AccountError, TransferSuccess] = for {
     accAccessSrc <- getAccountAccess(srcAccNum)
     accAccessDest <- getAccountAccess(destAccNum)
-    _ <- EitherT.right(accAccessSrc.acquireAccount)
-    _ <- EitherT.right(accAccessDest.acquireAccount)
     transferResult <- EitherT(
-      F.guarantee(persistTransfer(accAccessSrc, accAccessDest, amount))(release(accAccessSrc, accAccessDest).void)
+      F.bracket(acquire(accAccessSrc, accAccessDest))(_ => persistTransfer(accAccessSrc, accAccessDest, amount))(_ => release(accAccessSrc, accAccessDest).void)
     )
   } yield transferResult
 
@@ -56,6 +53,9 @@ class AccountInMemoryDatabase[F[_]: ConcurrentEffect] private(storage: Ref[F, Ma
       } yield Right(TransferSuccess(accDebit, accCredit, amount))
     } else
       F.delay(Left(TransferFailed(accAccessSrc.account, accAccessDest.account, amount, s"Not enough funds available in account number: ${accAccessSrc.account.accNumber}")))
+
+  private def acquire(accAccess: AccountAccess[F]*): F[List[Account]] =
+    accAccess.toList.map(_.acquireAccount).sequence
 
   private def release(accAccess: AccountAccess[F]*): F[List[Account]] =
     accAccess.toList.map(_.releaseAccount).sequence
